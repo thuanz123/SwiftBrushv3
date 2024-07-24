@@ -93,6 +93,12 @@ def parse_args(input_args=None):
         help=("The path to a text file containing all training prompts"),
     )
     parser.add_argument(
+        "--num_infer_steps",
+        type=int,
+        default=4,
+        help="Number of inference steps used for generating images.",
+    )
+    parser.add_argument(
         "--validation_prompts",
         type=str,
         default=None,
@@ -100,18 +106,12 @@ def parse_args(input_args=None):
         help=("A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."),
     )
     parser.add_argument(
-        "--num_validation_images",
-        type=int,
-        default=4,
-        help="Number of images that should be generated during validation with `validation_prompt`.",
-    )
-    parser.add_argument(
         "--validation_steps",
         type=int,
         default=1,
         help=(
             "Run fine-tuning validation every X steps. The validation process consists of running the prompts"
-            " `args.validation_prompts` multiple times: `args.num_validation_images`."
+            " `args.validation_prompts`."
         ),
     )
     parser.add_argument(
@@ -250,7 +250,7 @@ def parse_args(input_args=None):
     parser.add_argument("--guidance_scale", type=float, default=7.5, help="The classifier-free guidance scale.")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=0.0, help="Weight decay to use.")
+    parser.add_argument("--adam_weight_decay", type=float, default=0.0001, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     parser.add_argument(
@@ -342,31 +342,42 @@ def encode_prompt(prompts, text_encoder, tokenizer, is_train=True):
 
 
 @torch.no_grad()
-def inference(vae, unet, noise_scheduler, encoded_embeds, generator, device, weight_dtype):
+def inference(vae, unet, noise_scheduler, encoded_embeds, max_steps, generator, device, weight_dtype):
     input_shape = (1, 4, args.resolution // 8, args.resolution // 8)
     input_noise = torch.randn(input_shape, generator=generator, device=device, dtype=weight_dtype)
 
     prompt_embed = encoded_embeds["prompt_embeds"]
     prompt_embed = prompt_embed.to(device, weight_dtype)
 
-    pred_original_sample = predict_original(unet, noise_scheduler, input_noise, prompt_embed)
-    pred_original_sample = pred_original_sample / vae.config.scaling_factor
+    images = []
+    for num_step in range(1, max_steps + 1):
+        pred_original_sample = predict_original(unet, noise_scheduler, input_noise, prompt_embed, num_step, max_steps)
+        pred_original_sample = pred_original_sample / vae.config.scaling_factor
 
-    image = vae.decode(pred_original_sample.to(dtype=vae.dtype)).sample.float()
-    image = (image[0].detach().cpu() * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        image = vae.decode(pred_original_sample.to(dtype=vae.dtype)).sample.float()
+        image = (image[0].detach().cpu() * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        images.append(image)
 
-    return image
+    return images
 
 
-def predict_original(unet, noise_scheduler, input_noise, prompt_embeds):
-    max_timesteps = torch.ones((input_noise.shape[0],), dtype=torch.int64, device=input_noise.device)
-    max_timesteps = max_timesteps * (noise_scheduler.config.num_train_timesteps - 1)
+def predict_original(unet, noise_scheduler, input_noise, prompt_embeds, num_steps, max_steps):
+    noise_scheduler.set_timesteps(max_steps)
+    timesteps = noise_scheduler.timesteps
+    
+    with torch.no_grad():
+        prev_sample = input_noise
+        for index, timestep in enumerate(timesteps):
+            if index == num_steps - 1:
+                break
 
-    alpha_T, sigma_T = 0.0047**0.5, (1 - 0.0047) ** 0.5
-    model_pred = unet(input_noise, max_timesteps, prompt_embeds).sample
+            model_pred = unet(prev_sample, timestep, prompt_embeds).sample
+            prev_sample = noise_scheduler.step(model_pred, timestep, prev_sample).prev_sample
 
-    latents = (input_noise - sigma_T * model_pred) / alpha_T
-    return latents
+    model_pred = unet(prev_sample, timesteps[index], prompt_embeds).sample
+    pred_original_sample = noise_scheduler.step(model_pred, timesteps[index], prev_sample).pred_original_sample
+    
+    return pred_original_sample
 
 
 class PromptDataset(Dataset):
@@ -574,11 +585,11 @@ def main(args):
                 "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
             )
 
-        optimizer_class = bnb.optim.Adam8bit
-        optimizer_lora_class = bnb.optim.Adam8bit
+        optimizer_class = bnb.optim.AdamW8bit
+        optimizer_lora_class = bnb.optim.AdamW8bit
     else:
-        optimizer_class = torch.optim.Adam
-        optimizer_lora_class = torch.optim.Adam
+        optimizer_class = torch.optim.AdamW
+        optimizer_lora_class = torch.optim.AdamW
 
     # Optimizer creation
     optimizer = optimizer_class(
@@ -732,6 +743,7 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet, teacher_lora):
                 bsz = batch["prompt_embeds"].shape[0]
+                num_steps = random.randint(1, args.num_infer_steps)
 
                 # Sample noise that we'll input into the model
                 input_shape = (bsz, 4, args.resolution // 8, args.resolution // 8)
@@ -744,9 +756,9 @@ def main(args):
                 )
 
                 # Get predicted original sampls from unet
-                pred_original_samples = predict_original(unet, noise_scheduler, input_noise, prompt_embeds).to(
-                    dtype=weight_dtype
-                )
+                pred_original_samples = predict_original(
+                    unet, noise_scheduler, input_noise, prompt_embeds, num_steps, args.num_infer_steps
+                ).to(dtype=weight_dtype)
 
                 # VSD loss
 
@@ -872,15 +884,15 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if global_step % args.validation_steps == 0 or global_step == args.max_train_steps:
-                        if args.validation_prompts is not None and args.num_validation_images > 0:
+                        if args.validation_prompts is not None:
                             if args.use_ema:
                                 # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                                 ema_unet.store(unet.parameters())
                                 ema_unet.copy_to(unet.parameters())
 
                             logger.info(
-                                "Running validation... \nGenerating {} images with prompts:\n  {}".format(
-                                    args.num_validation_images, "\n  ".join(args.validation_prompts)
+                                "Running validation... \nGenerating images in {} steps with prompts:\n  {}".format(
+                                    args.num_infer_steps, "\n  ".join(args.validation_prompts)
                                 )
                             )
 
@@ -894,18 +906,16 @@ def main(args):
                             with torch.cuda.amp.autocast():
                                 images = {}
                                 for prompt, validation_dict in zip(args.validation_prompts, validation_dicts):
-                                    images[prompt] = [
-                                        inference(
-                                            vae,
-                                            unet,
-                                            noise_scheduler,
-                                            validation_dict,
-                                            generator=generator,
-                                            device=accelerator.device,
-                                            weight_dtype=weight_dtype,
-                                        )
-                                        for _ in range(args.num_validation_images)
-                                    ]
+                                    images[prompt] = inference(
+                                        vae,
+                                        unet,
+                                        noise_scheduler,
+                                        validation_dict,
+                                        args.num_infer_steps,
+                                        generator=generator,
+                                        device=accelerator.device,
+                                        weight_dtype=weight_dtype,
+                                    )
 
                             for tracker in accelerator.trackers:
                                 for prompt in args.validation_prompts:
