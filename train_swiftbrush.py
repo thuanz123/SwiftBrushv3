@@ -363,20 +363,17 @@ def inference(vae, unet, noise_scheduler, encoded_embeds, max_steps, generator, 
 
 def predict_original(unet, noise_scheduler, input_noise, prompt_embeds, num_steps, max_steps):
     noise_scheduler.set_timesteps(max_steps)
-    timesteps = noise_scheduler.timesteps
     
-    with torch.no_grad():
-        prev_sample = input_noise
-        for index, timestep in enumerate(timesteps):
-            if index == num_steps - 1:
-                break
+    prev_sample = input_noise
+    for index, timestep in enumerate(timesteps):
+        if index == num_steps:
+            break
 
-            model_pred = unet(prev_sample, timestep, prompt_embeds).sample
-            prev_sample = noise_scheduler.step(model_pred, timestep, prev_sample).prev_sample
-
-    model_pred = unet(prev_sample, timesteps[index], prompt_embeds).sample
-    pred_original_sample = noise_scheduler.step(model_pred, timesteps[index], prev_sample).pred_original_sample
-    
+        model_pred = unet(prev_sample, timestep, prompt_embeds).sample
+        output = noise_scheduler.step(model_pred, timestep, prev_sample)
+        prev_sample = output.prev_sample
+        
+    pred_original_sample = output.pred_original_sample
     return pred_original_sample
 
 
